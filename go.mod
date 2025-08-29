@@ -1,4 +1,4 @@
-module github.com/letdown2491/haven
+module github.com/bitvora/haven
 
 go 1.24.1
 
