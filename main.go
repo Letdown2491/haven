@@ -13,7 +13,7 @@ import (
 	"github.com/fiatjaf/khatru"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/spf13/afero"
-	"github.com/letdown2491/haven/internal/whitelist"
+	"github.com/Letdown2491/haven/tree/feature/whitelist-owner/internals/whitelist"
 )
 
 var (
