@@ -10,7 +10,7 @@ import (
 
 	"github.com/fiatjaf/khatru"
 	"github.com/nbd-wtf/go-nostr"
-	"github.com/letdown2491/haven/internals/whitelist"
+	"github.com/letdown2491/haven/internal/whitelist"
 )
 
 // ------------------------------------------------------------------------------------
