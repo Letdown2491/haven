@@ -10,9 +10,9 @@ import (
 	"net/http"
 
 	"github.com/fiatjaf/khatru"
+	"github.com/letdown2491/haven/internal/whitelist"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/spf13/afero"
-	"github.com/letdown2491/haven/internal/whitelist"
 )
 
 var (
@@ -22,7 +22,7 @@ var (
 )
 
 func main() {
-	// Initialize whitelists once at startup (open behavior if files are missing/empty).
+	// 1) Initialize whitelists once at startup (open behavior if files are missing/empty).
 	if err := whitelist.InitFromEnv(); err != nil {
 		log.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func main() {
 	// Create relays, DB hooks, routes, etc.
 	initRelays()
 
-	// Apply whitelist gates after relays/DB QueryEvents are set up.
+	// 2) Apply whitelist gates after relays/DB QueryEvents are set up.
 	wireWhitelistGates(nPubToPubkey(config.OwnerNpub))
 
 	go func() {
