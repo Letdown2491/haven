@@ -22,22 +22,32 @@ var (
 )
 
 func main() {
-	initWhitelist() // Check on rebase
+	// Initialize whitelists once at startup (open behavior if files are missing/empty).
+	if err := whitelist.InitFromEnv(); err != nil {
+		log.Fatal(err)
+	}
+
 	importFlag := flag.Bool("import", false, "Run the importNotes function after initializing relays")
 	flag.Parse()
 
 	nostr.InfoLogger = log.New(io.Discard, "", 0)
 	slog.SetLogLoggerLevel(getLogLevelFromConfig())
+
 	green := "\033[32m"
 	reset := "\033[0m"
 	fmt.Println(green + art + reset)
 	log.Println("🚀 HAVEN", config.RelayVersion, "is booting up")
+
 	fs = afero.NewOsFs()
 	if err := fs.MkdirAll(config.BlossomPath, 0755); err != nil {
 		log.Fatal("🚫 error creating blossom path:", err)
 	}
 
+	// Create relays, DB hooks, routes, etc.
 	initRelays()
+
+	// Apply whitelist gates after relays/DB QueryEvents are set up.
+	wireWhitelistGates(nPubToPubkey(config.OwnerNpub))
 
 	go func() {
 		ensureImportRelays()

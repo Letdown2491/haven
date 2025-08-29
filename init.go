@@ -86,24 +86,21 @@ func initRelays(cfg Config, store EventStore) (outboxRelay *khatru.Relay, inboxR
 
 	// OUTBOX read constraint
 	prevOutboxQuery := outboxRelay.QueryEvents
-	outboxRelay.QueryEvents = func(ctx context.Context, f nostr.Filter) (chan *nostr.Event, error) {
-		whitelist.ReadWL.ApplyReadToFilter(&f)
-		if prevOutboxQuery != nil {
-			return prevOutboxQuery(ctx, f)
-		}
-		// Fallback: direct to store if no previous handler
-		return store.QueryEvents(ctx, f)
-	}
+		outboxRelay.QueryEvents = append(outboxRelay.QueryEvents,
+	    func(ctx context.Context, f nostr.Filter) (chan *nostr.Event, error) {
+	        whitelist.ReadWL.ApplyReadToFilter(&f)
+	        return outboxDB.QueryEvents(ctx, f)
+	    },
+	)
 
 	// INBOX read constraint
 	prevInboxQuery := inboxRelay.QueryEvents
-	inboxRelay.QueryEvents = func(ctx context.Context, f nostr.Filter) (chan *nostr.Event, error) {
-		whitelist.ReadWL.ApplyReadToFilter(&f)
-		if prevInboxQuery != nil {
-			return prevInboxQuery(ctx, f)
-		}
-		return store.QueryEvents(ctx, f)
-	}
+		inboxRelay.QueryEvents = append(inboxRelay.QueryEvents,
+	    func(ctx context.Context, f nostr.Filter) (chan *nostr.Event, error) {
+	        whitelist.ReadWL.ApplyReadToFilter(&f)
+	        return inboxDB.QueryEvents(ctx, f)
+	    },
+	)
 
 	// ----------------------------- RETURN -----------------------------
 	return outboxRelay, inboxRelay, nil

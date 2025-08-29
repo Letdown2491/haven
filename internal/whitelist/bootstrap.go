@@ -24,11 +24,11 @@ func InitFromEnv() error {
 	var err error
 	ReadWL, err = Load(readFile)
 	if err != nil {
-		 return err
+		return err
 	}
 	WriteWL, err = Load(writeFile)
 	if err != nil {
-		 return err
+		return err
 	}
 	return nil
 }
