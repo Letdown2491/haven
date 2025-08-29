@@ -8,10 +8,12 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+	"internal"
 
 	"github.com/fiatjaf/khatru"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/spf13/afero"
+	"github.com/letdown2491/haven/internal/whitelist"
 )
 
 var (
@@ -21,6 +23,7 @@ var (
 )
 
 func main() {
+	initWhitelist() // Check on rebase
 	importFlag := flag.Bool("import", false, "Run the importNotes function after initializing relays")
 	flag.Parse()
 

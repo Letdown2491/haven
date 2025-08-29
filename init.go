@@ -1,468 +1,110 @@
+// init.go — whitelist-integrated relay wiring (template)
+// Adjust TODOs to match your repo’s actual types and module paths.
+
 package main
 
 import (
-	"bytes"
 	"context"
-	"io"
-	"log/slog"
-	"net/http"
-	"text/template"
-	"time"
+	"log"
+	"strings"
 
-	"github.com/fiatjaf/eventstore/badger"
-	"github.com/fiatjaf/eventstore/lmdb"
 	"github.com/fiatjaf/khatru"
-	"github.com/fiatjaf/khatru/blossom"
-	"github.com/fiatjaf/khatru/policies"
 	"github.com/nbd-wtf/go-nostr"
+	"github.com/letdown2491/haven/internal/whitelist"
 )
 
-var (
-	privateRelay = khatru.NewRelay()
-	privateDB    = newDBBackend("db/private")
-)
+// ------------------------------------------------------------------------------------
+// TODO: replace these with your actual config and store types.
+// ------------------------------------------------------------------------------------
+type Config struct {
+	OwnerNpub string
+}
 
-var (
-	chatRelay = khatru.NewRelay()
-	chatDB    = newDBBackend("db/chat")
-)
+type EventStore interface {
+	QueryEvents(ctx context.Context, f nostr.Filter) (chan *nostr.Event, error)
+	// ... any other methods your store exposes
+}
 
-var (
+// TODO: replace with your existing helper that turns npub -> hex pubkey
+func nPubToPubkey(npub string) string {
+	// stub for template; use your real implementation
+	return strings.ToLower(npub)
+}
+
+// ------------------------------------------------------------------------------------
+// initWhitelist is called early during process boot.
+// You may call this from main.go too; having it here guarantees it's initialized
+// before any relay wiring that references ReadWL/WriteWL.
+// ------------------------------------------------------------------------------------
+func init() {
+	if err := whitelist.InitFromEnv(); err != nil {
+		log.Fatalf("failed to initialize whitelist: %v", err)
+	}
+}
+
+// ------------------------------------------------------------------------------------
+// initRelays wires up your relays with SW2-style whitelist logic
+//  - WRITE gate: RejectEvent wrapper using whitelist.AllowedToWrite(...)
+//  - READ gate: QueryEvents wrapper that constrains f.Authors via ApplyReadToFilter
+//
+// Return whichever relays your program uses (outbox/inbox/chat/etc.).
+// ------------------------------------------------------------------------------------
+func initRelays(cfg Config, store EventStore) (outboxRelay *khatru.Relay, inboxRelay *khatru.Relay, err error) {
+	// TODO: If your code creates relays elsewhere, move this logic next to that code
+	// and just apply the wrappers shown below.
 	outboxRelay = khatru.NewRelay()
-	outboxDB    = newDBBackend("db/outbox")
-)
-
-var (
 	inboxRelay = khatru.NewRelay()
-	inboxDB    = newDBBackend("db/inbox")
-)
 
-var blossomDB = newDBBackend("db/blossom")
-
-type DBBackend interface {
-	Init() error
-	Close()
-	CountEvents(ctx context.Context, filter nostr.Filter) (int64, error)
-	DeleteEvent(ctx context.Context, evt *nostr.Event) error
-	QueryEvents(ctx context.Context, filter nostr.Filter) (chan *nostr.Event, error)
-	SaveEvent(ctx context.Context, evt *nostr.Event) error
-	ReplaceEvent(ctx context.Context, evt *nostr.Event) error
-	Serial() []byte
-}
-
-func newDBBackend(path string) DBBackend {
-	switch config.DBEngine {
-	case "lmdb":
-		return newLMDBBackend(path)
-	case "badger":
-		return &badger.BadgerBackend{
-			Path: path,
+	// ----------------------------- WRITE GATE (EVENT) -----------------------------
+	// Wrap existing RejectEvent for OUTBOX
+	prevOutboxReject := outboxRelay.RejectEvent
+	outboxRelay.RejectEvent = func(ctx context.Context, ev *nostr.Event) (bool, string) {
+		// Owner override + write whitelist
+		if !whitelist.AllowedToWrite(ev.PubKey, nPubToPubkey(cfg.OwnerNpub)) {
+			return true, "pubkey not in write whitelist"
 		}
-	default:
-		return newLMDBBackend(path)
-	}
-}
-
-func newLMDBBackend(path string) *lmdb.LMDBBackend {
-	return &lmdb.LMDBBackend{
-		Path:    path,
-		MapSize: config.LmdbMapSize,
-	}
-}
-
-func initRelays() {
-	if err := privateDB.Init(); err != nil {
-		panic(err)
-	}
-
-	if err := chatDB.Init(); err != nil {
-		panic(err)
-	}
-
-	if err := outboxDB.Init(); err != nil {
-		panic(err)
-	}
-
-	if err := inboxDB.Init(); err != nil {
-		panic(err)
-	}
-
-	if err := blossomDB.Init(); err != nil {
-		panic(err)
-	}
-
-	initRelayLimits()
-
-	privateRelay.Info.Name = config.PrivateRelayName
-	privateRelay.Info.PubKey = nPubToPubkey(config.PrivateRelayNpub)
-	privateRelay.Info.Description = config.PrivateRelayDescription
-	privateRelay.Info.Icon = config.PrivateRelayIcon
-	privateRelay.Info.Version = config.RelayVersion
-	privateRelay.Info.Software = config.RelaySoftware
-	privateRelay.ServiceURL = "https://" + config.RelayURL + "/private"
-
-	if !privateRelayLimits.AllowEmptyFilters {
-		privateRelay.RejectFilter = append(privateRelay.RejectFilter, policies.NoEmptyFilters)
-	}
-
-	if !privateRelayLimits.AllowComplexFilters {
-		privateRelay.RejectFilter = append(privateRelay.RejectFilter, policies.NoComplexFilters)
-	}
-
-	privateRelay.RejectEvent = append(privateRelay.RejectEvent,
-		policies.RejectEventsWithBase64Media,
-		policies.EventIPRateLimiter(
-			privateRelayLimits.EventIPLimiterTokensPerInterval,
-			time.Minute*time.Duration(privateRelayLimits.EventIPLimiterInterval),
-			privateRelayLimits.EventIPLimiterMaxTokens,
-		),
-	)
-
-	privateRelay.RejectConnection = append(privateRelay.RejectConnection,
-		policies.ConnectionRateLimiter(
-			privateRelayLimits.ConnectionRateLimiterTokensPerInterval,
-			time.Minute*time.Duration(privateRelayLimits.ConnectionRateLimiterInterval),
-			privateRelayLimits.ConnectionRateLimiterMaxTokens,
-		),
-	)
-
-	privateRelay.OnConnect = append(privateRelay.OnConnect, func(ctx context.Context) {
-		khatru.RequestAuth(ctx)
-	})
-
-	privateRelay.StoreEvent = append(privateRelay.StoreEvent, privateDB.SaveEvent)
-	privateRelay.QueryEvents = append(privateRelay.QueryEvents, privateDB.QueryEvents)
-	privateRelay.DeleteEvent = append(privateRelay.DeleteEvent, privateDB.DeleteEvent)
-	privateRelay.CountEvents = append(privateRelay.CountEvents, privateDB.CountEvents)
-	privateRelay.ReplaceEvent = append(privateRelay.ReplaceEvent, privateDB.ReplaceEvent)
-
-	privateRelay.RejectFilter = append(privateRelay.RejectFilter, func(ctx context.Context, filter nostr.Filter) (bool, string) {
-		authenticatedUser := khatru.GetAuthed(ctx)
-		if authenticatedUser == nPubToPubkey(config.OwnerNpub) {
-			return false, ""
+		if prevOutboxReject != nil {
+			return prevOutboxReject(ctx, ev)
 		}
-
-		return true, "auth-required: this query requires you to be authenticated"
-	})
-
-	privateRelay.RejectEvent = append(privateRelay.RejectEvent, func(ctx context.Context, event *nostr.Event) (bool, string) {
-		authenticatedUser := khatru.GetAuthed(ctx)
-
-		if authenticatedUser == nPubToPubkey(config.OwnerNpub) {
-			return false, ""
-		}
-
-		return true, "auth-required: publishing this event requires authentication"
-	})
-
-	mux := privateRelay.Router()
-
-	mux.HandleFunc("GET /private", func(w http.ResponseWriter, r *http.Request) {
-		tmpl := template.Must(template.ParseFiles("templates/index.html"))
-		data := struct {
-			RelayName        string
-			RelayPubkey      string
-			RelayDescription string
-			RelayURL         string
-		}{
-			RelayName:        config.PrivateRelayName,
-			RelayPubkey:      nPubToPubkey(config.PrivateRelayNpub),
-			RelayDescription: config.PrivateRelayDescription,
-			RelayURL:         "wss://" + config.RelayURL + "/private",
-		}
-		err := tmpl.Execute(w, data)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-	})
-
-	chatRelay.Info.Name = config.ChatRelayName
-	chatRelay.Info.PubKey = nPubToPubkey(config.ChatRelayNpub)
-	chatRelay.Info.Description = config.ChatRelayDescription
-	chatRelay.Info.Icon = config.ChatRelayIcon
-	chatRelay.Info.Version = config.RelayVersion
-	chatRelay.Info.Software = config.RelaySoftware
-	chatRelay.ServiceURL = "https://" + config.RelayURL + "/chat"
-
-	if !chatRelayLimits.AllowEmptyFilters {
-		chatRelay.RejectFilter = append(chatRelay.RejectFilter, policies.NoEmptyFilters)
-	}
-
-	if !chatRelayLimits.AllowComplexFilters {
-		chatRelay.RejectFilter = append(chatRelay.RejectFilter, policies.NoComplexFilters)
-	}
-
-	chatRelay.RejectEvent = append(chatRelay.RejectEvent,
-		policies.RejectEventsWithBase64Media,
-		policies.EventIPRateLimiter(
-			chatRelayLimits.EventIPLimiterTokensPerInterval,
-			time.Minute*time.Duration(chatRelayLimits.EventIPLimiterInterval),
-			chatRelayLimits.EventIPLimiterMaxTokens,
-		),
-	)
-
-	chatRelay.RejectConnection = append(chatRelay.RejectConnection,
-		policies.ConnectionRateLimiter(
-			chatRelayLimits.ConnectionRateLimiterTokensPerInterval,
-			time.Minute*time.Duration(chatRelayLimits.ConnectionRateLimiterInterval),
-			chatRelayLimits.ConnectionRateLimiterMaxTokens,
-		),
-	)
-
-	chatRelay.OnConnect = append(chatRelay.OnConnect, func(ctx context.Context) {
-		khatru.RequestAuth(ctx)
-	})
-
-	chatRelay.StoreEvent = append(chatRelay.StoreEvent, chatDB.SaveEvent)
-	chatRelay.QueryEvents = append(chatRelay.QueryEvents, chatDB.QueryEvents)
-	chatRelay.DeleteEvent = append(chatRelay.DeleteEvent, chatDB.DeleteEvent)
-	chatRelay.CountEvents = append(chatRelay.CountEvents, chatDB.CountEvents)
-	chatRelay.ReplaceEvent = append(chatRelay.ReplaceEvent, chatDB.ReplaceEvent)
-
-	chatRelay.RejectFilter = append(chatRelay.RejectFilter, func(ctx context.Context, filter nostr.Filter) (bool, string) {
-		authenticatedUser := khatru.GetAuthed(ctx)
-
-		if !wotMap[authenticatedUser] {
-			return true, "you must be in the web of trust to chat with the relay owner"
-		}
-
 		return false, ""
-	})
-
-	allowedKinds := []int{
-		// Regular kinds
-		nostr.KindSimpleGroupChatMessage,
-		nostr.KindSimpleGroupThreadedReply,
-		nostr.KindSimpleGroupThread,
-		nostr.KindSimpleGroupReply,
-		nostr.KindChannelMessage,
-		nostr.KindChannelHideMessage,
-
-		nostr.KindGiftWrap,
-
-		nostr.KindSimpleGroupPutUser,
-		nostr.KindSimpleGroupRemoveUser,
-		nostr.KindSimpleGroupEditMetadata,
-		nostr.KindSimpleGroupDeleteEvent,
-		nostr.KindSimpleGroupCreateGroup,
-		nostr.KindSimpleGroupDeleteGroup,
-		nostr.KindSimpleGroupCreateInvite,
-		nostr.KindSimpleGroupJoinRequest,
-		nostr.KindSimpleGroupLeaveRequest,
-
-		// Addressable kinds
-		nostr.KindSimpleGroupMetadata,
-		nostr.KindSimpleGroupAdmins,
-		nostr.KindSimpleGroupMembers,
-		nostr.KindSimpleGroupRoles,
 	}
 
-	chatRelay.RejectEvent = append(chatRelay.RejectEvent, func(ctx context.Context, event *nostr.Event) (bool, string) {
-		for _, kind := range allowedKinds {
-			if event.Kind == kind {
-				return false, ""
-			}
+	// (Optional) also gate INBOX writes (if your design allows public writes there)
+	prevInboxReject := inboxRelay.RejectEvent
+	inboxRelay.RejectEvent = func(ctx context.Context, ev *nostr.Event) (bool, string) {
+		if !whitelist.AllowedToWrite(ev.PubKey, nPubToPubkey(cfg.OwnerNpub)) {
+			return true, "pubkey not in write whitelist"
 		}
-
-		return true, "only chat related events are allowed"
-	})
-
-	mux = chatRelay.Router()
-
-	mux.HandleFunc("GET /chat", func(w http.ResponseWriter, r *http.Request) {
-		tmpl := template.Must(template.ParseFiles("templates/index.html"))
-		data := struct {
-			RelayName        string
-			RelayPubkey      string
-			RelayDescription string
-			RelayURL         string
-		}{
-			RelayName:        config.ChatRelayName,
-			RelayPubkey:      nPubToPubkey(config.ChatRelayNpub),
-			RelayDescription: config.ChatRelayDescription,
-			RelayURL:         "wss://" + config.RelayURL + "/chat",
+		if prevInboxReject != nil {
+			return prevInboxReject(ctx, ev)
 		}
-		err := tmpl.Execute(w, data)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-	})
-
-	outboxRelay.Info.Name = config.OutboxRelayName
-	outboxRelay.Info.PubKey = nPubToPubkey(config.OutboxRelayNpub)
-	outboxRelay.Info.Description = config.OutboxRelayDescription
-	outboxRelay.Info.Icon = config.OutboxRelayIcon
-	outboxRelay.Info.Version = config.RelayVersion
-	outboxRelay.Info.Software = config.RelaySoftware
-	outboxRelay.ServiceURL = "https://" + config.RelayURL
-
-	if !outboxRelayLimits.AllowEmptyFilters {
-		outboxRelay.RejectFilter = append(outboxRelay.RejectFilter, policies.NoEmptyFilters)
+		return false, ""
 	}
 
-	if !outboxRelayLimits.AllowComplexFilters {
-		outboxRelay.RejectFilter = append(outboxRelay.RejectFilter, policies.NoComplexFilters)
+	// ----------------------------- READ GATE (REQ) -----------------------------
+	// Wrap QueryEvents so we constrain Authors before hitting the store.
+
+	// OUTBOX read constraint
+	prevOutboxQuery := outboxRelay.QueryEvents
+	outboxRelay.QueryEvents = func(ctx context.Context, f nostr.Filter) (chan *nostr.Event, error) {
+		whitelist.ReadWL.ApplyReadToFilter(&f)
+		if prevOutboxQuery != nil {
+			return prevOutboxQuery(ctx, f)
+		}
+		// Fallback: direct to store if no previous handler
+		return store.QueryEvents(ctx, f)
 	}
 
-	outboxRelay.RejectEvent = append(outboxRelay.RejectEvent,
-		policies.RejectEventsWithBase64Media,
-		policies.EventIPRateLimiter(
-			outboxRelayLimits.EventIPLimiterTokensPerInterval,
-			time.Minute*time.Duration(outboxRelayLimits.EventIPLimiterInterval),
-			outboxRelayLimits.EventIPLimiterMaxTokens,
-		),
-	)
-
-	outboxRelay.RejectConnection = append(outboxRelay.RejectConnection,
-		policies.ConnectionRateLimiter(
-			outboxRelayLimits.ConnectionRateLimiterTokensPerInterval,
-			time.Minute*time.Duration(outboxRelayLimits.ConnectionRateLimiterInterval),
-			outboxRelayLimits.ConnectionRateLimiterMaxTokens,
-		),
-	)
-
-	outboxRelay.StoreEvent = append(outboxRelay.StoreEvent, outboxDB.SaveEvent, func(ctx context.Context, event *nostr.Event) error {
-		go blast(event)
-		return nil
-	})
-	outboxRelay.QueryEvents = append(outboxRelay.QueryEvents, outboxDB.QueryEvents)
-	outboxRelay.DeleteEvent = append(outboxRelay.DeleteEvent, outboxDB.DeleteEvent)
-	outboxRelay.CountEvents = append(outboxRelay.CountEvents, outboxDB.CountEvents)
-	outboxRelay.ReplaceEvent = append(outboxRelay.ReplaceEvent, outboxDB.ReplaceEvent)
-
-	outboxRelay.RejectEvent = append(outboxRelay.RejectEvent, func(ctx context.Context, event *nostr.Event) (bool, string) {
-		if event.PubKey == nPubToPubkey(config.OwnerNpub) {
-			return false, ""
+	// INBOX read constraint
+	prevInboxQuery := inboxRelay.QueryEvents
+	inboxRelay.QueryEvents = func(ctx context.Context, f nostr.Filter) (chan *nostr.Event, error) {
+		whitelist.ReadWL.ApplyReadToFilter(&f)
+		if prevInboxQuery != nil {
+			return prevInboxQuery(ctx, f)
 		}
-		return true, "only notes signed by the owner of this relay are allowed"
-	})
-
-	mux = outboxRelay.Router()
-
-	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		tmpl := template.Must(template.ParseFiles("templates/index.html"))
-		data := struct {
-			RelayName        string
-			RelayPubkey      string
-			RelayDescription string
-			RelayURL         string
-		}{
-			RelayName:        config.OutboxRelayName,
-			RelayPubkey:      nPubToPubkey(config.OutboxRelayNpub),
-			RelayDescription: config.OutboxRelayDescription,
-			RelayURL:         "wss://" + config.RelayURL + "/outbox",
-		}
-		err := tmpl.Execute(w, data)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-	})
-
-	bl := blossom.New(outboxRelay, "https://"+config.RelayURL)
-	bl.Store = blossom.EventStoreBlobIndexWrapper{Store: blossomDB, ServiceURL: bl.ServiceURL}
-	bl.StoreBlob = append(bl.StoreBlob, func(ctx context.Context, sha256 string, ext string, body []byte) error {
-		slog.Debug("storing blob", "sha256", sha256, "ext", ext)
-		file, err := fs.Create(config.BlossomPath + sha256)
-		if err != nil {
-			return err
-		}
-		if _, err := io.Copy(file, bytes.NewReader(body)); err != nil {
-			return err
-		}
-		return nil
-	})
-	bl.LoadBlob = append(bl.LoadBlob, func(ctx context.Context, sha256 string, ext string) (io.ReadSeeker, error) {
-		slog.Debug("loading blob", "sha256", sha256, "ext", ext)
-		return fs.Open(config.BlossomPath + sha256)
-	})
-	bl.DeleteBlob = append(bl.DeleteBlob, func(ctx context.Context, sha256 string, ext string) error {
-		slog.Debug("deleting blob", "sha256", sha256, "ext", ext)
-		return fs.Remove(config.BlossomPath + sha256)
-	})
-	bl.RejectUpload = append(bl.RejectUpload, func(ctx context.Context, event *nostr.Event, size int, ext string) (bool, string, int) {
-		if event.PubKey == nPubToPubkey(config.OwnerNpub) {
-			return false, ext, size
-		}
-
-		return true, "only notes signed by the owner of this relay are allowed", 403
-	})
-	migrateBlossomMetadata(bl)
-
-	inboxRelay.Info.Name = config.InboxRelayName
-	inboxRelay.Info.PubKey = nPubToPubkey(config.InboxRelayNpub)
-	inboxRelay.Info.Description = config.InboxRelayDescription
-	inboxRelay.Info.Icon = config.InboxRelayIcon
-	inboxRelay.Info.Version = config.RelayVersion
-	inboxRelay.Info.Software = config.RelaySoftware
-	inboxRelay.ServiceURL = "https://" + config.RelayURL + "/inbox"
-
-	if !inboxRelayLimits.AllowEmptyFilters {
-		inboxRelay.RejectFilter = append(inboxRelay.RejectFilter, policies.NoEmptyFilters)
+		return store.QueryEvents(ctx, f)
 	}
 
-	if !inboxRelayLimits.AllowComplexFilters {
-		inboxRelay.RejectFilter = append(inboxRelay.RejectFilter, policies.NoComplexFilters)
-	}
-
-	inboxRelay.RejectEvent = append(inboxRelay.RejectEvent,
-		policies.RejectEventsWithBase64Media,
-		policies.EventIPRateLimiter(
-			inboxRelayLimits.EventIPLimiterTokensPerInterval,
-			time.Minute*time.Duration(inboxRelayLimits.EventIPLimiterInterval),
-			inboxRelayLimits.EventIPLimiterMaxTokens,
-		),
-	)
-
-	inboxRelay.RejectConnection = append(inboxRelay.RejectConnection,
-		policies.ConnectionRateLimiter(
-			inboxRelayLimits.ConnectionRateLimiterTokensPerInterval,
-			time.Minute*time.Duration(inboxRelayLimits.ConnectionRateLimiterInterval),
-			inboxRelayLimits.ConnectionRateLimiterMaxTokens,
-		),
-	)
-
-	inboxRelay.StoreEvent = append(inboxRelay.StoreEvent, inboxDB.SaveEvent)
-	inboxRelay.QueryEvents = append(inboxRelay.QueryEvents, inboxDB.QueryEvents)
-	inboxRelay.DeleteEvent = append(inboxRelay.DeleteEvent, inboxDB.DeleteEvent)
-	inboxRelay.CountEvents = append(inboxRelay.CountEvents, inboxDB.CountEvents)
-	inboxRelay.ReplaceEvent = append(inboxRelay.ReplaceEvent, inboxDB.ReplaceEvent)
-
-	inboxRelay.RejectEvent = append(inboxRelay.RejectEvent, func(ctx context.Context, event *nostr.Event) (bool, string) {
-		if !wotMap[event.PubKey] {
-			return true, "you must be in the web of trust to post to this relay"
-		}
-
-		if event.Kind == nostr.KindEncryptedDirectMessage {
-			return true, "only gift wrapped DMs are supported"
-		}
-
-		if event.Tags.FindWithValue("p", inboxRelay.Info.PubKey) != nil {
-			return false, ""
-		}
-
-		return true, "you can only post notes if you've tagged the owner of this relay"
-	})
-
-	mux = inboxRelay.Router()
-
-	mux.HandleFunc("GET /inbox", func(w http.ResponseWriter, r *http.Request) {
-		tmpl := template.Must(template.ParseFiles("templates/index.html"))
-		data := struct {
-			RelayName        string
-			RelayPubkey      string
-			RelayDescription string
-			RelayURL         string
-		}{
-			RelayName:        config.InboxRelayName,
-			RelayPubkey:      nPubToPubkey(config.InboxRelayNpub),
-			RelayDescription: config.InboxRelayDescription,
-			RelayURL:         "wss://" + config.RelayURL + "/inbox",
-		}
-		err := tmpl.Execute(w, data)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-	})
-
+	// ----------------------------- RETURN -----------------------------
+	return outboxRelay, inboxRelay, nil
 }
